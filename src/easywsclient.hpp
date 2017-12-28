@@ -34,6 +34,7 @@ class WebSocket {
     virtual void sendBinary(const std::vector<uint8_t>& message) = 0;
     virtual void sendPing() = 0;
     virtual void close() = 0;
+    virtual bool isSSL() = 0;
     virtual readyStateValues getReadyState() const = 0;
 
     template<class Callable>

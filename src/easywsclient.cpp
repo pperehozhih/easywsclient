@@ -71,6 +71,10 @@
 
 #include <vector>
 #include <string>
+#include <cassert>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "easywsclient.hpp"
 
@@ -78,8 +82,96 @@ using easywsclient::Callback_Imp;
 using easywsclient::BytesCallback_Imp;
 
 namespace { // private module-only namespace
+    class isocket {
+    public:
+        virtual bool is_invalid() = 0;
+        virtual ssize_t send(const void *buf, size_t len, int flags) = 0;
+        virtual ssize_t recv(void *buf, size_t len, int flags) = 0;
+        virtual void set_options() = 0;
+        virtual void close() = 0;
+        virtual void set_timeout(int timeout, bool have_buf) = 0;
+        virtual bool is_ssl() = 0;
+    };
 
-socket_t hostname_connect(const std::string& hostname, int port) {
+    typedef std::shared_ptr<isocket> isocket_ptr;
+    
+    class raw_socket : public isocket {
+    public:
+        raw_socket(socket_t s):m_socket(s){}
+        virtual bool is_invalid(){
+            return m_socket == INVALID_SOCKET;
+        }
+        virtual ssize_t send(const void *buf, size_t len, int flags) {
+            return ::send(m_socket, buf, len, flags);
+        }
+        virtual ssize_t recv(void *buf, size_t len, int flags){
+            return ::recv(m_socket, buf, len, flags);
+        }
+        virtual void set_options() {
+            // Disable Nagle's algorithm
+            int flag = 1;
+            setsockopt(m_socket, IPPROTO_TCP, TCP_NODELAY, (char*) &flag, sizeof(flag));
+#ifdef _WIN32
+            u_long on = 1;
+            ioctlsocket(m_socket, FIONBIO, &on);
+#else
+            fcntl(m_socket, F_SETFL, O_NONBLOCK);
+#endif
+        }
+        virtual void close() {
+            closesocket(m_socket);
+            m_socket = INVALID_SOCKET;
+        }
+        virtual void set_timeout(int timeout, bool have_buf){
+            fd_set rfds;
+            fd_set wfds;
+            timeval tv = { timeout/1000, (timeout%1000) * 1000 };
+            FD_ZERO(&rfds);
+            FD_ZERO(&wfds);
+            FD_SET(m_socket, &rfds);
+            if (have_buf) { FD_SET(m_socket, &wfds); }
+            select(m_socket + 1, &rfds, &wfds, 0, timeout > 0 ? &tv : 0);
+        }
+        virtual bool is_ssl(){
+            return false;
+        }
+        virtual ~raw_socket(){
+            close();
+        }
+    private:
+        socket_t m_socket;
+    };
+
+    class ssl_socket : public raw_socket {
+    public:
+        ssl_socket(socket_t s):raw_socket(s) {
+            const SSL_METHOD *meth = SSLv23_method();
+            ctx = SSL_CTX_new (meth);
+            ssl = SSL_new (ctx);
+            SSL_set_fd(ssl, s);
+            SSL_connect(ssl);
+        }
+        virtual ssize_t send(const void *buf, size_t len, int) {
+            return SSL_write(ssl, buf, len);
+        }
+        virtual ssize_t recv(void *buf, size_t len, int){
+            return SSL_read(ssl, buf, len);
+        }
+        virtual bool is_ssl(){
+            return true;
+        }
+        virtual ~ssl_socket() {
+            if (ssl)
+                SSL_free(ssl);
+            if (ssl)
+                SSL_CTX_free(ctx);
+        }
+    private:
+        SSL *ssl = nullptr;
+        SSL_CTX *ctx = nullptr;
+    };
+
+isocket_ptr hostname_connect(const std::string& hostname, int port, bool is_ssl) {
     struct addrinfo hints;
     struct addrinfo *result;
     struct addrinfo *p;
@@ -93,7 +185,7 @@ socket_t hostname_connect(const std::string& hostname, int port) {
     if ((ret = getaddrinfo(hostname.c_str(), sport, &hints, &result)) != 0)
     {
       fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
-      return 1;
+      return isocket_ptr();
     }
     for(p = result; p != NULL; p = p->ai_next)
     {
@@ -106,7 +198,12 @@ socket_t hostname_connect(const std::string& hostname, int port) {
         sockfd = INVALID_SOCKET;
     }
     freeaddrinfo(result);
-    return sockfd;
+    if (is_ssl == false) {
+        return isocket_ptr(new raw_socket(sockfd));
+    } else {
+        return isocket_ptr(new ssl_socket(sockfd));
+    }
+    return isocket_ptr();
 }
 
 
@@ -118,7 +215,8 @@ class _DummyWebSocket : public easywsclient::WebSocket
     void sendBinary(const std::string& message) { }
     void sendBinary(const std::vector<uint8_t>& message) { }
     void sendPing() { }
-    void close() { } 
+    void close() { }
+    bool isSSL() { return false; }
     readyStateValues getReadyState() const { return CLOSED; }
     void _dispatch(Callback_Imp & callable) { }
     void _dispatchBinary(BytesCallback_Imp& callable) { }
@@ -169,11 +267,15 @@ class _RealWebSocket : public easywsclient::WebSocket
     std::vector<uint8_t> txbuf;
     std::vector<uint8_t> receivedData;
 
-    socket_t sockfd;
+    isocket_ptr isockfd;
     readyStateValues readyState;
     bool useMask;
 
-    _RealWebSocket(socket_t sockfd, bool useMask) : sockfd(sockfd), readyState(OPEN), useMask(useMask) {
+    _RealWebSocket(isocket_ptr sockfd, bool useMask) : isockfd(sockfd), readyState(OPEN), useMask(useMask) {
+    }
+
+    bool isSSL() {
+        return isockfd ? isockfd->is_ssl() : false;
     }
 
     readyStateValues getReadyState() const {
@@ -189,21 +291,14 @@ class _RealWebSocket : public easywsclient::WebSocket
             return;
         }
         if (timeout != 0) {
-            fd_set rfds;
-            fd_set wfds;
-            timeval tv = { timeout/1000, (timeout%1000) * 1000 };
-            FD_ZERO(&rfds);
-            FD_ZERO(&wfds);
-            FD_SET(sockfd, &rfds);
-            if (txbuf.size()) { FD_SET(sockfd, &wfds); }
-            select(sockfd + 1, &rfds, &wfds, 0, timeout > 0 ? &tv : 0);
+            isockfd->set_timeout(timeout, txbuf.size());
         }
         while (true) {
             // FD_ISSET(0, &rfds) will be true
             int N = rxbuf.size();
             ssize_t ret;
             rxbuf.resize(N + 1500);
-            ret = recv(sockfd, (char*)&rxbuf[0] + N, 1500, 0);
+            ret = isockfd->recv((char*)&rxbuf[0] + N, 1500, 0);
             if (false) { }
             else if (ret < 0 && (socketerrno == SOCKET_EWOULDBLOCK || socketerrno == SOCKET_EAGAIN_EINPROGRESS)) {
                 rxbuf.resize(N);
@@ -211,7 +306,6 @@ class _RealWebSocket : public easywsclient::WebSocket
             }
             else if (ret <= 0) {
                 rxbuf.resize(N);
-                closesocket(sockfd);
                 readyState = CLOSED;
                 fputs(ret < 0 ? "Connection error!\n" : "Connection closed!\n", stderr);
                 break;
@@ -221,13 +315,13 @@ class _RealWebSocket : public easywsclient::WebSocket
             }
         }
         while (txbuf.size()) {
-            int ret = ::send(sockfd, (char*)&txbuf[0], txbuf.size(), 0);
+            int ret = isockfd->send((char*)&txbuf[0], txbuf.size(), 0);
             if (false) { } // ??
             else if (ret < 0 && (socketerrno == SOCKET_EWOULDBLOCK || socketerrno == SOCKET_EAGAIN_EINPROGRESS)) {
                 break;
             }
             else if (ret <= 0) {
-                closesocket(sockfd);
+                isockfd->close();
                 readyState = CLOSED;
                 fputs(ret < 0 ? "Connection error!\n" : "Connection closed!\n", stderr);
                 break;
@@ -237,7 +331,7 @@ class _RealWebSocket : public easywsclient::WebSocket
             }
         }
         if (!txbuf.size() && readyState == CLOSING) {
-            closesocket(sockfd);
+            isockfd->close();
             readyState = CLOSED;
         }
     }
@@ -426,10 +520,11 @@ class _RealWebSocket : public easywsclient::WebSocket
 
 
 easywsclient::WebSocket::pointer from_url(const std::string& url, bool useMask, const std::string& origin) {
-    char host[128];
-    int port;
-    char path[128];
-    if (url.size() >= 128) {
+    const int max_size_buff = 512;
+    char host[max_size_buff];
+    int port = 0;
+    char path[max_size_buff];
+    if (url.size() >= max_size_buff) {
       fprintf(stderr, "ERROR: url size limit exceeded: %s\n", url.c_str());
       return NULL;
     }
@@ -437,67 +532,73 @@ easywsclient::WebSocket::pointer from_url(const std::string& url, bool useMask, 
       fprintf(stderr, "ERROR: origin size limit exceeded: %s\n", origin.c_str());
       return NULL;
     }
-    if (false) { }
-    else if (sscanf(url.c_str(), "ws://%[^:/]:%d/%s", host, &port, path) == 3) {
-    }
-    else if (sscanf(url.c_str(), "ws://%[^:/]/%s", host, path) == 2) {
-        port = 80;
-    }
-    else if (sscanf(url.c_str(), "ws://%[^:/]:%d", host, &port) == 2) {
+    bool is_ssl = true;
+    bool default_port = false;
+    if (sscanf(url.c_str(), "wss://%[^:/]:%d/%s", host, &port, path) == 3) {
+        
+    } else if (sscanf(url.c_str(), "wss://%[^:/]/%s", host, path) == 2) {
+        port = 443;
+    } else if (sscanf(url.c_str(), "wss://%[^:/]:%d", host, &port) == 2) {
+        path[0] = '\0';
+    } else if (sscanf(url.c_str(), "wss://%[^:/]", host) == 1) {
+        port = 443;
         path[0] = '\0';
     }
-    else if (sscanf(url.c_str(), "ws://%[^:/]", host) == 1) {
-        port = 80;
-        path[0] = '\0';
-    }
-    else {
-        fprintf(stderr, "ERROR: Could not parse WebSocket url: %s\n", url.c_str());
-        return NULL;
+    default_port = port == 443;
+    if (port == 0) {
+        is_ssl = false;
+        if (sscanf(url.c_str(), "ws://%[^:/]:%d/%s", host, &port, path) == 3) {
+            
+        } else if (sscanf(url.c_str(), "ws://%[^:/]/%s", host, path) == 2) {
+            port = 80;
+        } else if (sscanf(url.c_str(), "ws://%[^:/]:%d", host, &port) == 2) {
+            path[0] = '\0';
+        } else if (sscanf(url.c_str(), "ws://%[^:/]", host) == 1) {
+            port = 80;
+            path[0] = '\0';
+        } else {
+            fprintf(stderr, "ERROR: Could not parse WebSocket url: %s\n", url.c_str());
+            return NULL;
+        }
+        default_port = port == 80;
     }
     fprintf(stderr, "easywsclient: connecting: host=%s port=%d path=/%s\n", host, port, path);
-    socket_t sockfd = hostname_connect(host, port);
-    if (sockfd == INVALID_SOCKET) {
+    isocket_ptr sockfd = hostname_connect(host, port, is_ssl);
+    if (!sockfd ||  sockfd->is_invalid()) {
         fprintf(stderr, "Unable to connect to %s:%d\n", host, port);
         return NULL;
     }
     {
         // XXX: this should be done non-blocking,
-        char line[256];
+        char line[max_size_buff];
         int status;
         int i;
-        snprintf(line, 256, "GET /%s HTTP/1.1\r\n", path); ::send(sockfd, line, strlen(line), 0);
-        if (port == 80) {
-            snprintf(line, 256, "Host: %s\r\n", host); ::send(sockfd, line, strlen(line), 0);
+        snprintf(line, max_size_buff, "GET /%s HTTP/1.1\r\n", path); sockfd->send(line, strlen(line), 0);
+        if (default_port) {
+            snprintf(line, max_size_buff, "Host: %s\r\n", host); sockfd->send(line, strlen(line), 0);
         }
         else {
-            snprintf(line, 256, "Host: %s:%d\r\n", host, port); ::send(sockfd, line, strlen(line), 0);
+            snprintf(line, max_size_buff, "Host: %s:%d\r\n", host, port); sockfd->send(line, strlen(line), 0);
         }
-        snprintf(line, 256, "Upgrade: websocket\r\n"); ::send(sockfd, line, strlen(line), 0);
-        snprintf(line, 256, "Connection: Upgrade\r\n"); ::send(sockfd, line, strlen(line), 0);
+        snprintf(line, max_size_buff, "Upgrade: websocket\r\n"); sockfd->send(line, strlen(line), 0);
+        snprintf(line, max_size_buff, "Connection: Upgrade\r\n"); sockfd->send(line, strlen(line), 0);
         if (!origin.empty()) {
-            snprintf(line, 256, "Origin: %s\r\n", origin.c_str()); ::send(sockfd, line, strlen(line), 0);
+            snprintf(line, max_size_buff, "Origin: %s\r\n", origin.c_str()); sockfd->send(line, strlen(line), 0);
         }
-        snprintf(line, 256, "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n"); ::send(sockfd, line, strlen(line), 0);
-        snprintf(line, 256, "Sec-WebSocket-Version: 13\r\n"); ::send(sockfd, line, strlen(line), 0);
-        snprintf(line, 256, "\r\n"); ::send(sockfd, line, strlen(line), 0);
-        for (i = 0; i < 2 || (i < 255 && line[i-2] != '\r' && line[i-1] != '\n'); ++i) { if (recv(sockfd, line+i, 1, 0) == 0) { return NULL; } }
+        snprintf(line, max_size_buff, "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n"); sockfd->send(line, strlen(line), 0);
+        snprintf(line, max_size_buff, "Sec-WebSocket-Version: 13\r\n"); sockfd->send(line, strlen(line), 0);
+        snprintf(line, max_size_buff, "\r\n"); sockfd->send(line, strlen(line), 0);
+        for (i = 0; i < 2 || (i < 255 && line[i-2] != '\r' && line[i-1] != '\n'); ++i) { if (sockfd->recv(line+i, 1, 0) == 0) { return NULL; } }
         line[i] = 0;
-        if (i == 255) { fprintf(stderr, "ERROR: Got invalid status line connecting to: %s\n", url.c_str()); return NULL; }
+        if (i == max_size_buff) { fprintf(stderr, "ERROR: Got invalid status line connecting to: %s\n", url.c_str()); return NULL; }
         if (sscanf(line, "HTTP/1.1 %d", &status) != 1 || status != 101) { fprintf(stderr, "ERROR: Got bad status connecting to %s: %s", url.c_str(), line); return NULL; }
         // TODO: verify response headers,
         while (true) {
-            for (i = 0; i < 2 || (i < 255 && line[i-2] != '\r' && line[i-1] != '\n'); ++i) { if (recv(sockfd, line+i, 1, 0) == 0) { return NULL; } }
+            for (i = 0; i < 2 || (i < 255 && line[i-2] != '\r' && line[i-1] != '\n'); ++i) { if (sockfd->recv(line+i, 1, 0) == 0) { return NULL; } }
             if (line[0] == '\r' && line[1] == '\n') { break; }
         }
     }
-    int flag = 1;
-    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char*) &flag, sizeof(flag)); // Disable Nagle's algorithm
-#ifdef _WIN32
-    u_long on = 1;
-    ioctlsocket(sockfd, FIONBIO, &on);
-#else
-    fcntl(sockfd, F_SETFL, O_NONBLOCK);
-#endif
+    sockfd->set_options();
     fprintf(stderr, "Connected to: %s\n", url.c_str());
     return easywsclient::WebSocket::pointer(new _RealWebSocket(sockfd, useMask));
 }
