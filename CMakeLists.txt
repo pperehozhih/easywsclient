@@ -3,14 +3,17 @@ cmake_minimum_required(VERSION 2.8)
 aux_source_directory(src EASYWS_SRC_LIST)
 file (GLOB EASYWS_HEADER_LIST "src/*.h*")
 source_group(easyws FILES ${EASYWS_SRC_LIST} ${EASYWS_HEADER_LIST})
-find_package(OpenSSL REQUIRED)
-message("OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
-message("OpenSSL libraries: ${OPENSSL_LIBRARIES}")
+if (NOT OPENSSL_INCLUDE_DIR)
+	find_package(OpenSSL REQUIRED)
+	message("OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
+	message("OpenSSL libraries: ${OPENSSL_LIBRARIES}")
+endif()
 include_directories(
-   ${OPENSSL_INCLUDE_DIR}
-   src
+	${OPENSSL_INCLUDE_DIR}
+   	src
 )
-add_library(${PROJECT_NAME} ${EASYWS_SRC_LIST} ${EASYWS_HEADER_LIST})
+add_library(${PROJECT_NAME} ${EASYWS_SRC_LIST} ${EASYWS_HEADER_LIST} ${OPENSSL_LIBRARIES})
+target_link_libraries( ${PROJECT_NAME} ${OPENSSL_LIBRARIES} )
 if (EASYWS_TEST)
    aux_source_directory(test-ssl EASYWS_TEST_SRC_LIST)
    file (GLOB EASYWS_TEST_HEADER_LIST "test-ssl/*.h*")

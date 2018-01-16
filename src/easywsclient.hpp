@@ -15,6 +15,8 @@ namespace easywsclient {
 
 struct Callback_Imp { virtual void operator()(const std::string& message) = 0; };
 struct BytesCallback_Imp { virtual void operator()(const std::vector<uint8_t>& message) = 0; };
+   
+typedef int (*log_function)(const char * __format, ...);
 
 class WebSocket {
   public:
@@ -25,6 +27,7 @@ class WebSocket {
     static pointer create_dummy();
     static pointer from_url(const std::string& url, const std::string& origin = std::string());
     static pointer from_url_no_mask(const std::string& url, const std::string& origin = std::string());
+    static void set_logging(log_function log);
 
     // Interfaces:
     virtual ~WebSocket() { }
@@ -32,6 +35,7 @@ class WebSocket {
     virtual void send(const std::string& message) = 0;
     virtual void sendBinary(const std::string& message) = 0;
     virtual void sendBinary(const std::vector<uint8_t>& message) = 0;
+    virtual void sendBinary(size_t size, uint8_t* begin, uint8_t* end) = 0;
     virtual void sendPing() = 0;
     virtual void close() = 0;
     virtual bool isSSL() = 0;
