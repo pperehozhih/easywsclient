@@ -41,6 +41,8 @@
     #define SOCKET_EAGAIN_EINPROGRESS WSAEINPROGRESS
     #define SOCKET_EWOULDBLOCK WSAEWOULDBLOCK
 #else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
     #include <fcntl.h>
     #include <netdb.h>
     #include <netinet/tcp.h>
