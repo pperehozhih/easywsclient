@@ -105,10 +105,10 @@ namespace { // private module-only namespace
             return m_socket == INVALID_SOCKET;
         }
         virtual ssize_t send(const void *buf, size_t len, int flags) {
-            return ::send(m_socket, buf, len, flags);
+            return ::send(m_socket, static_cast<const char*>(buf), len, flags);
         }
         virtual ssize_t recv(void *buf, size_t len, int flags){
-            return ::recv(m_socket, buf, len, flags);
+            return ::recv(m_socket, static_cast<char*>(buf), len, flags);
         }
         virtual void set_options() {
             // Disable Nagle's algorithm

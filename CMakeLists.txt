@@ -13,7 +13,7 @@ include_directories(
    	src
 )
 add_library(${PROJECT_NAME} ${EASYWS_SRC_LIST} ${EASYWS_HEADER_LIST} ${OPENSSL_LIBRARIES})
-set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 11)
+set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 14)
 target_link_libraries( ${PROJECT_NAME} ${OPENSSL_LIBRARIES} )
 if (EASYWS_TEST)
    aux_source_directory(test-ssl EASYWS_TEST_SRC_LIST)
