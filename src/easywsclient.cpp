@@ -74,6 +74,7 @@
 #include <vector>
 #include <string>
 #include <cassert>
+#include <memory>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
